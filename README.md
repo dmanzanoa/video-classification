@@ -1,30 +1,31 @@
-# Video Classification with CNN–RNN
+# Exercise Video Classification
 
-This repository contains code for building and training a video classifier using a hybrid convolutional–recurrent neural network (CNN–RNN) architecture.  The project originated from a Jupyter/Colab notebook for action recognition on the UCF101 dataset, but has been cleaned up and modularised for reuse in different environments.
+This repository contains code for building and training a video classifier for exercise recognition using a CNN–RNN architecture. It was inspired by the deep learning study "Exploring a Deep Learning Approach for Video Analysis Applied to Older Adults Fall Risk," where short videos of older adults performing exercises were used to assess fall risk. The provided code has been refactored into reusable functions so it can be applied to any collection of labelled videos organised via a CSV metadata file.
 
 ## Overview
 
-Videos are sequences of images and therefore contain both spatial and temporal information.  To model these aspects simultaneously, we use a convolutional neural network (CNN) backbone for extracting frame‑level features and a gated recurrent unit (GRU) for modelling dependencies across time.  The default backbone is a pre‑trained EfficientNetB0, but this can be replaced with any image classification model available in TensorFlow’s model zoo.
+Videos contain both spatial and temporal information. To model these aspects simultaneously, the code uses a convolutional neural network (CNN) backbone to extract frame‑level features and a gated recurrent unit (GRU) to model dependencies across time. The default backbone is EfficientNetB0 pretrained on ImageNet, but you can substitute any suitable Keras application.
 
-The code includes utilities for augmenting raw videos using [vidaug](https://github.com/okankop/vidaug).  Random transformations such as flips, blurs, elastic deformations and colour perturbations are applied to increase the robustness of the model.
+Augmentation utilities are provided via [`vidaug`](https://github.com/okankop/vidaug) to apply random flips, blurs, noise and brightness shifts, helping improve robustness.
 
 ## Repository structure
 
 | Path | Purpose |
 | --- | --- |
-| `video_classification.py` | Main Python script containing the model definition, data augmentation helpers and a skeleton training loop. |
+| `video_classification.py` | Main Python module containing functions for loading datasets from CSVs, optional class balancing, video loading and augmentation, and a model builder that constructs a CNN–RNN classifier. |
 | `requirements.txt` | List of Python dependencies needed to run the code. |
+| `README.md` | Project documentation and usage instructions. |
 
 ## Dataset
 
-The original notebook used a subsampled version of the [UCF101](https://www.crcv.ucf.edu/data/UCF101.php) dataset consisting of short video clips grouped into action categories.  To use this repository, download the videos yourself from the official UCF101 website or any other dataset of interest and organise them into separate folders per class.  The `augment_dataset` function in `video_classification.py` illustrates how to generate additional training examples through augmentation.
+The code expects a CSV file with at least two columns: a `path` column pointing to each video file and a `label` column containing the class name. Use the `load_dataframe` function to read this CSV and optionally oversample classes to mitigate imbalance. Videos should be organised anywhere on disk; there is no prescribed folder hierarchy.
 
 ## Installation
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/<your‑username>/video‑classification.git
-   cd video‑classification
+   git clone https://github.com/<your-username>/video-classification.git
+   cd video-classification
    ```
 2. Create a virtual environment (recommended) and install dependencies:
    ```bash
@@ -32,35 +33,38 @@ The original notebook used a subsampled version of the [UCF101](https://www.crcv
    source .venv/bin/activate
    pip install -r requirements.txt
    ```
-3. Ensure you have a working installation of FFmpeg; `scikit‑video` relies on it for reading and writing video files.
 
 ## Usage
 
-The `video_classification.py` script is designed to be a starting point.  It defines the model architecture and provides helper functions for video augmentation.  You will need to implement the dataset loading logic yourself.  A typical workflow looks like this:
+Below is a minimal example of how to use the library to build a model. You will need to implement frame extraction and batching for your specific dataset.
 
 ```python
-from video_classification import build_model, augment_dataset
+from video_classification import load_dataframe, load_video, augment_video, build_model, encode_labels
+import numpy as np
+import tensorflow as tf
 
-# Step 1: optionally augment your dataset
-augment_dataset("data/raw_videos", "data/augmented", n_per_video=10)
+# Load metadata from CSV
+df = load_dataframe("train_metadata.csv", balance=True)
+paths = df["path"].tolist()
+labels = df["label"].tolist()
 
-# Step 2: prepare a tf.data.Dataset that yields batches of
-# shape (batch_size, time_steps, height, width, 3) and labels
-train_dataset = ...  # TODO: implement
-val_dataset = ...    # TODO: implement
+# Encode string labels to integers
+y, encoder = encode_labels(labels)
 
-# Step 3: build and compile the model
-model = build_model()
-model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+# Build model for the number of classes in your dataset
+num_classes = len(encoder.classes_)
+model = build_model(num_classes)
 
-# Step 4: train
-model.fit(train_dataset, validation_data=val_dataset, epochs=50)
+# TODO: implement a generator that yields batches of (frames, labels)
+# frames = [load_video(p) for p in paths] or create an on-the-fly loader
+# model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+# model.fit(data_generator, epochs=20, validation_data=val_generator)
 ```
 
-## Example application: fall‑risk assessment for older adults
+## Background
 
-An interesting application of video classification to healthcare is described in the book chapter *“Exploring a Deep Learning Approach for Video Analysis Applied to Older Adults Fall Risk”*.  In that study the authors recorded older adults performing various exercises and developed eight deep‑learning models—including 3D convolutional networks and recurrent architectures—to classify the recorded movements and identify which exercises correlate with higher risk of falling.  According to their report, the models achieved accuracy values between **71 % and 89 %** depending on the specific exercise.  This demonstrates how video analysis can support assessments of functional mobility and highlights potential future directions for projects like this.
+In the work "Exploring a Deep Learning Approach for Video Analysis Applied to Older Adults Fall Risk" the authors recorded older adults performing a battery of exercises and developed eight different deep‑learning models—including CNN and GRU architectures—to classify the movements.  Their models achieved between **71 % and 89 % accuracy** depending on the exercise【87114770475911†screenshot】.  This repository adapts that approach into a general codebase that can be used as a starting point for similar video‑based exercise classification projects.
 
 ## Credits
 
-The original implementation and description were created by Sayak Paul in a Colab notebook for the TensorFlow tutorials.  This repository adapts that work into a standalone Python project suitable for further experimentation and extension.
+Original ideas were inspired by the TensorFlow action recognition tutorial by Sayak Paul and extended to the fall‑risk assessment context.  The present version refactors that notebook into a standalone Python module.
