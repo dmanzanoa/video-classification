@@ -1,264 +1,281 @@
 #!/usr/bin/env python
 """
-Video Classification with a CNN–RNN Architecture
-================================================
+Video Classification for Exercise Analysis
+========================================
 
-This script provides a cleaned up and modularised version of the Colab notebook
-originally published by Sayak Paul for action recognition on the UCF101 dataset.
-The goal of the project is to build a video classifier that can recognise
-different actions from short clips.  A hybrid model is used that combines
-convolutional layers (for spatial feature extraction) with recurrent layers
-(for temporal modelling).  The original notebook mixed environment setup,
-package installation and data augmentation in a single monolithic cell.  This
-version extracts reusable functionality into functions and removes any
-Jupyter‑specific commands.  Dataset download and mounting of Google Drive are
-left to the user – see the README for details on obtaining the UCF101 data.
+This module provides a general purpose toolkit for building and training
+video classification models using a hybrid convolutional–recurrent
+architecture.  It is tailored for problems like exercise recognition
+where short clips need to be assigned to one of several movements or
+activities.  The default model combines a convolutional backbone for
+per‑frame feature extraction with a gated recurrent unit (GRU) to
+capture temporal dynamics.  The code is written to be framework agnostic
+with respect to the dataset: you supply a CSV describing where your
+videos live and what label each belongs to, and optionally enable
+automatic class balancing.
 
-Functions
----------
-* ``video_augmentation(frames)`` – applies a random affine transformation and
-  colour jitter to a sequence of frames using ``ImageDataGenerator``.
-* ``augment_dataset(input_dir, output_dir, n_per_video=25)`` – iterates
-  through all video files in ``input_dir`` and writes augmented copies to
-  ``output_dir``.  The output filenames are based on the input name and the
-  iteration index.  You can adjust ``n_per_video`` to control how many
-  augmented samples to generate per original video.
-* ``build_model(img_size, max_seq_length, num_features)`` – creates a
-  convolutional backbone (using a pre‑trained EfficientNet) and stacks a
-  gated recurrent unit (GRU) on top for temporal modelling.  The function
-  returns an uncompiled ``tf.keras.Model``.
-
-The ``main`` function provides a scaffold for training and evaluating the
-model.  You will need to implement data loading (e.g. by parsing TFRecord
-files or reading frames from disk) and assemble the dataset into
-``tf.data`` pipelines.  See the original Colab notebook for guidance on
-sampling frames from videos.
-
-Requirements
+Key features
 ------------
-This script assumes TensorFlow 2.5 or higher.  Additional third‑party
-packages required include ``scikit-video`` (for writing videos), ``vidaug``
-for video augmentation, ``imutils`` for convenience functions, and
-``sklearn`` for evaluation metrics.  Please refer to the provided
-``requirements.txt`` file in this repository for the full list of
-dependencies.
+* **CSV‑driven data loading:** specify your dataset using a CSV with
+  columns for the file path and label.  Use ``load_dataframe`` to read
+  the CSV and optionally oversample classes to mitigate imbalance.
+* **Reproducible augmentation:** the optional ``augment_video`` function
+  illustrates how to apply random transformations to a sequence of
+  frames using the ``vidaug`` library.  You can adapt or remove this
+  depending on your own augmentation strategy.
+* **Modular model construction:** ``build_model`` creates a
+  convolutional feature extractor (EfficientNetB0 by default) and
+  stacks a GRU on top.  Swap ``EfficientNetB0`` for another Keras
+  application model if desired.
+* **Utility functions:** helper routines for loading frames from disk
+  (``load_video``), extracting features in batches, and balancing
+  training data via random oversampling are included.
+
+This script does not perform end‑to‑end training by itself.  Instead it
+defines reusable building blocks that can be composed in your own
+training loop or integrated into a larger pipeline.  See the README
+for a high level overview and refer to the ``main`` section at the
+bottom of this file for a minimal usage example.
 """
+
+from __future__ import annotations
 
 import os
 import random
-from typing import List
+from dataclasses import dataclass
+from typing import Iterable, List, Tuple
 
+import cv2  # type: ignore
 import numpy as np
+import pandas as pd
 import tensorflow as tf
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from sklearn.preprocessing import LabelEncoder
+from sklearn.utils import resample
 from tensorflow import keras
-import skvideo.io  # type: ignore
 
 try:
-    from vidaug import augmentors as va
+    from vidaug import augmentors as va  # type: ignore
 except ImportError:
-    raise ImportError(
-        "vidaug is not installed. Install it with `pip install git+https://github.com/okankop/vidaug`."
-    )
-
+    va = None  # augmentation is optional
 
 # -----------------------------------------------------------------------------
-# Hyperparameters
+# Hyperparameters and defaults
 #
-# You can override these values when calling ``build_model`` or in your
-# training script.  They are defined here for convenience.
+# These values can be overridden when calling ``build_model`` or other
+# functions.  Adjust them according to your own dataset and experiments.
 # -----------------------------------------------------------------------------
 IMG_SIZE: int = 224
-BATCH_SIZE: int = 64
-EPOCHS: int = 100
-MAX_SEQ_LENGTH: int = 500
+MAX_SEQ_LENGTH: int = 400
 NUM_FEATURES: int = 2560
 
 
+def load_dataframe(csv_path: str, path_col: str = "path", label_col: str = "label", balance: bool = False) -> pd.DataFrame:
+    """Load a dataset description from a CSV file.
 
-def video_augmentation(frames: np.ndarray) -> np.ndarray:
-    """Apply random affine transformations to a sequence of frames.
+    The CSV is expected to contain at least two columns: one with the file
+    system path to each video and another with the corresponding class
+    label.  Additional columns are ignored.  When ``balance`` is True
+    the returned frame is randomly oversampled so that all classes
+    contain the same number of samples as the largest class.
 
     Parameters
     ----------
-    frames : np.ndarray
-        A 4‑D array of shape ``(num_frames, height, width, channels)``.
+    csv_path : str
+        Path to a CSV file.  Each row should correspond to a single video.
+    path_col : str, optional
+        Name of the column containing the file path, by default ``"path"``.
+    label_col : str, optional
+        Name of the column containing the class label, by default ``"label"``.
+    balance : bool, optional
+        Whether to oversample minority classes to match the size of the
+        majority class, by default ``False``.
 
     Returns
     -------
-    np.ndarray
-        The augmented frames with the same shape as the input.
+    pandas.DataFrame
+        A DataFrame with at least the ``path_col`` and ``label_col`` present.
     """
-    # Randomly sample parameters for the affine transformation.
-    theta = random.randint(0, 360)
-    tx = random.randint(0, 40)
-    ty = random.randint(0, 40)
-    zx = 1.0
-    zy = 1.0
-    flip_horizontal = random.choice([True, False])
-    flip_vertical = False
-    channel_shift_intensity = random.uniform(0.0, 1.0)
-
-    gen = ImageDataGenerator()
-    transform_params = {
-        "theta": theta,
-        "tx": tx,
-        "ty": ty,
-        "zx": zx,
-        "zy": zy,
-        "flip_horizontal": flip_horizontal,
-        "flip_vertical": flip_vertical,
-        "channel_shift_intensity": channel_shift_intensity,
-        "fill_mode": "nearest",
-        "brightness": 1,
-    }
-    new_frames = np.zeros_like(frames)
-    for i in range(len(frames)):
-        new_frames[i] = gen.apply_transform(frames[i], transform_params)
-    return new_frames.astype(np.uint8)
+    df = pd.read_csv(csv_path)
+    if balance:
+        # Determine the size of the largest class
+        max_count = df[label_col].value_counts().max()
+        balanced_frames: List[pd.DataFrame] = []
+        for label, group in df.groupby(label_col):
+            if len(group) < max_count:
+                balanced_group = resample(group, replace=True, n_samples=max_count, random_state=42)
+            else:
+                balanced_group = group
+            balanced_frames.append(balanced_group)
+        df = pd.concat(balanced_frames).reset_index(drop=True)
+    return df[[path_col, label_col]].copy()
 
 
-def augment_dataset(input_dir: str, output_dir: str, n_per_video: int = 25) -> None:
-    """Generate augmented video samples for each video in ``input_dir``.
+def load_video(path: str, max_frames: int = 0, resize: Tuple[int, int] = (IMG_SIZE, IMG_SIZE)) -> np.ndarray:
+    """Load a video from disk into a numpy array of frames.
 
-    This utility iterates over all files in ``input_dir``.  For each file it
-    loads the video frames (you need to implement ``load_video`` yourself or
-    substitute a suitable video loading routine), applies a random
-    augmentation sequence using ``vidaug``, and writes ``n_per_video`` new
-    videos into ``output_dir``.  The category of the video is inferred from
-    the filename; the resulting augmented files preserve the category name
-    prefix.
+    Frames are centre‑cropped to a square and resized to ``resize``.  If
+    ``max_frames`` is non‑zero the returned array will contain at most
+    ``max_frames`` frames.
 
     Parameters
     ----------
-    input_dir : str
-        Directory containing the original videos.
-    output_dir : str
-        Directory where augmented videos will be saved.  The directory will be
-        created if it does not exist.
-    n_per_video : int, optional
-        Number of augmented samples to generate per input video, by default 25.
-    """
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
-    # Sort to ensure reproducible ordering
-    for lname, filename in enumerate(sorted(os.listdir(input_dir))):
-        input_path = os.path.join(input_dir, filename)
-        if not os.path.isfile(input_path):
-            continue
-        # You need to implement or import a ``load_video`` function that
-        # returns a 4‑D numpy array of frames from the input video.
-        frames = load_video(input_path)  # type: ignore[name-defined]
-
-        # Define a video augmentation pipeline using vidaug.  Feel free to
-        # customise the augmentation operators and their parameters.
-        seq = va.Sequential([
-            va.SomeOf([
-                va.VerticalFlip(),
-                va.HorizontalFlip(),
-                va.GaussianBlur(random.uniform(1.0, 1.5)),
-                va.PiecewiseAffineTransform(random.randint(1, 10), random.randint(1, 5), random.uniform(1.0, 1.5)),
-                va.Superpixel(random.randint(1, 10), random.randint(1, 10)),
-                va.ElasticTransformation(
-                    random.uniform(1.0, 10.0),
-                    random.uniform(1.0, 5.0),
-                    random.randint(1, 5),
-                    random.randint(1, 10),
-                    random.choice(["nearest", "constant", "wrap"]),
-                ),
-                va.InvertColor(),
-                va.Add(random.randint(1, 100)),
-                va.Multiply(random.uniform(0.5, 1.0)),
-                va.Pepper(),
-                va.Salt(),
-            ], 2)
-        ])
-
-        for i in range(n_per_video):
-            # Apply augmentation and save new video
-            augmented_frames = seq(np.array(frames, dtype=np.uint8))
-            augmented_frames = np.asarray(augmented_frames)
-
-            # Determine the category prefix from the filename.  In the
-            # original notebook, the category was inferred by checking
-            # substrings in the filename.  Here we use a simpler heuristic:
-            category = os.path.splitext(filename)[0]
-            out_name = f"{category}_{i}_{lname}.mp4"
-            out_path = os.path.join(output_dir, out_name)
-            skvideo.io.vwrite(out_path, augmented_frames, outputdict={"-vcodec": "mpeg2video"})
-
-
-
-def build_model(img_size: int = IMG_SIZE, max_seq_length: int = MAX_SEQ_LENGTH, num_features: int = NUM_FEATURES) -> keras.Model:
-    """Construct a CNN‑RNN model for video classification.
-
-    The model uses a convolutional backbone (EfficientNetB0) to extract
-    frame‑level features and a Gated Recurrent Unit (GRU) to model temporal
-    dynamics across frames.  The final classification layer can be adapted to
-    the number of classes in your dataset.
-
-    Parameters
-    ----------
-    img_size : int
-        Height and width to which frames will be resized.
-    max_seq_length : int
-        Maximum number of frames per video.  Videos shorter than this will
-        be padded, and longer videos truncated.
-    num_features : int
-        Dimensionality of the feature vector produced by the CNN backbone.
+    path : str
+        Filesystem path to the video.  Any format supported by OpenCV is
+        accepted.
+    max_frames : int, optional
+        Maximum number of frames to return, by default 0 (no limit).
+    resize : tuple of int, optional
+        Spatial resolution ``(height, width)`` for each frame, by default
+        ``(IMG_SIZE, IMG_SIZE)``.
 
     Returns
     -------
-    keras.Model
+    numpy.ndarray
+        A 4‑D tensor of shape ``(num_frames, height, width, 3)`` with dtype
+        ``np.uint8``.
+    """
+    cap = cv2.VideoCapture(path)
+    frames: List[np.ndarray] = []
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            # centre crop to square
+            h, w = frame.shape[:2]
+            min_dim = min(h, w)
+            top = (h - min_dim) // 2
+            left = (w - min_dim) // 2
+            frame = frame[top : top + min_dim, left : left + min_dim]
+            frame = cv2.resize(frame, resize)
+            # convert from BGR to RGB
+            frame = frame[:, :, ::-1]
+            frames.append(frame)
+            if max_frames and len(frames) >= max_frames:
+                break
+    finally:
+        cap.release()
+    return np.array(frames, dtype=np.uint8)
+
+
+def augment_video(frames: np.ndarray) -> np.ndarray:
+    """Apply a random augmentation sequence to a sequence of frames.
+
+    This function uses the ``vidaug`` library to compose a random
+    assortment of spatial transformations.  If ``vidaug`` is not
+    available the input is returned unchanged.
+
+    Parameters
+    ----------
+    frames : numpy.ndarray
+        A 4‑D array of frames with shape ``(num_frames, height, width, 3)``.
+
+    Returns
+    -------
+    numpy.ndarray
+        Augmented frames with the same shape as the input.
+    """
+    if va is None:
+        return frames
+    seq = va.Sequential([
+        va.SomeOf([
+            va.HorizontalFlip(),
+            va.VerticalFlip(),
+            va.GaussianBlur(random.uniform(1.0, 1.5)),
+            va.Pepper(),
+            va.Salt(),
+            va.Add(random.randint(1, 50)),
+            va.Multiply(random.uniform(0.6, 1.4)),
+        ], 2)
+    ])
+    augmented = seq(frames)
+    return np.asarray(augmented, dtype=np.uint8)
+
+
+def build_model(num_classes: int, img_size: int = IMG_SIZE, num_features: int = NUM_FEATURES, max_seq_length: int = MAX_SEQ_LENGTH) -> keras.Model:
+    """Construct a CNN–RNN model for video classification.
+
+    A convolutional base (EfficientNetB0) extracts per‑frame features and a
+    GRU aggregates them over time.  The final dense layer has size
+    ``num_classes`` with softmax activation.
+
+    Parameters
+    ----------
+    num_classes : int
+        Number of output classes.
+    img_size : int, optional
+        Input frame dimension.  Frames are assumed to be ``img_size × img_size``.
+    num_features : int, optional
+        Dimensionality of the feature extractor output per frame.
+    max_seq_length : int, optional
+        Maximum number of frames to consider.  Longer sequences will be
+        truncated.
+
+    Returns
+    -------
+    tensorflow.keras.Model
         An uncompiled Keras model ready for training.
     """
-    # CNN backbone using EfficientNetB0
-    base_model = tf.keras.applications.EfficientNetB0(
-        include_top=False, weights="imagenet", input_shape=(img_size, img_size, 3), pooling="avg"
+    # Backbone for feature extraction
+    base_model = keras.applications.EfficientNetB0(
+        include_top=False,
+        weights="imagenet",
+        pooling="avg",
+        input_shape=(img_size, img_size, 3),
     )
-    for layer in base_model.layers:
-        layer.trainable = False
+    preprocess_input = keras.applications.efficientnet.preprocess_input
 
-    cnn_input = keras.Input(shape=(None, img_size, img_size, 3), name="frames")
-    # TimeDistributed wrapper applies the CNN to each frame independently
-    features = keras.layers.TimeDistributed(base_model)(cnn_input)
-    features = keras.layers.TimeDistributed(keras.layers.Dense(num_features, activation="relu"))(features)
-    # GRU to model temporal dependencies
-    x = keras.layers.GRU(128, return_sequences=False)(features)
-    outputs = keras.layers.Dense(10, activation="softmax")(x)  # adjust 10 to the number of classes
+    # Define inputs: a batch of sequences of frames
+    inputs = keras.Input(shape=(None, img_size, img_size, 3), name="video_frames")
 
-    model = keras.Model(cnn_input, outputs, name="cnn_rnn_video_classifier")
+    # TimeDistributed layer applies the base model to each frame
+    def apply_cnn(frame_batch):
+        # collapse time dimension into batch dimension for preprocessing
+        b, t, h, w, c = tf.unstack(tf.shape(frame_batch))
+        frames_reshaped = tf.reshape(frame_batch, (-1, h, w, c))
+        x = preprocess_input(tf.cast(frames_reshaped, tf.float32))
+        x = base_model(x)
+        # reshape back to (batch, time, features)
+        x = tf.reshape(x, (b, t, -1))
+        return x
+
+    features = tf.keras.layers.Lambda(apply_cnn, name="frame_features")(inputs)
+
+    # Pad or truncate sequences to max_seq_length
+    features = tf.keras.layers.Lambda(lambda x: x[:, :max_seq_length, :], name="truncate_seq")(features)
+
+    # Temporal modelling with a GRU
+    x = keras.layers.GRU(num_features, return_sequences=False, name="gru")(features)
+    x = keras.layers.Dropout(0.3)(x)
+    outputs = keras.layers.Dense(num_classes, activation="softmax", name="classifier")(x)
+    model = keras.Model(inputs, outputs, name="cnn_rnn_video_classifier")
     return model
 
 
-def main(args: List[str] | None = None) -> None:
-    """Entry point for training the video classifier.
+def encode_labels(labels: Iterable[str]) -> Tuple[np.ndarray, LabelEncoder]:
+    """Encode string labels as integer indices.
 
-    This function outlines the typical workflow: preparing the dataset,
-    building the model, compiling it with an optimizer and loss, training,
-    and evaluating on a validation/test set.  Fill in the missing parts
-    according to your specific use case.
+    Parameters
+    ----------
+    labels : Iterable[str]
+        An iterable of class labels.
+
+    Returns
+    -------
+    tuple of numpy.ndarray and sklearn.preprocessing.LabelEncoder
+        The encoded labels and the fitted encoder.
     """
-    # TODO: implement data loading and preprocessing
-    # train_dataset, val_dataset = ...
-
-    # Build and compile the model
-    model = build_model()
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(),
-        loss="sparse_categorical_crossentropy",
-        metrics=["accuracy"],
-    )
-
-    # TODO: fit the model
-    # model.fit(train_dataset, validation_data=val_dataset, epochs=EPOCHS)
-
-    # TODO: evaluate the model
-    # test_loss, test_acc = model.evaluate(test_dataset)
-    # print(f"Test accuracy: {test_acc:.3f}")
-    pass
+    le = LabelEncoder()
+    y = le.fit_transform(list(labels))
+    return y, le
 
 
 if __name__ == "__main__":
-    main()
+    # Minimal usage example.  To run a real experiment you should replace
+    # ``example.csv`` with your own metadata file and implement a data
+    # generator that yields batches of frames and labels.  This demo will
+    # simply construct the model for a hypothetical dataset with three
+    # classes and print its summary.
+    print("Building model for 3 classes...")
+    model = build_model(num_classes=3)
+    model.summary()
