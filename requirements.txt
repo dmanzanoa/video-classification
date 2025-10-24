@@ -1,0 +1,10 @@
+tensorflow>=2.5
+tensorflow-docs>=0.0.0
+scikit-video
+git+https://github.com/okankop/vidaug
+imutils
+scikit-learn
+pandas
+numpy
+imageio
+opencv-python
